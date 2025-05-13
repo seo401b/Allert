@@ -3,7 +3,7 @@ const { extractTextFromImage, filterProductCandidates, matchProductName } = requ
 
 async function main() {
   try {
-    const imagePath = path.resolve(__dirname, 'milkpopcorn.png');
+    const imagePath = path.resolve(__dirname, 'test_img', 'milkpopcorn.png');
     const text = await extractTextFromImage(imagePath);
 
     const candidates = filterProductCandidates(text);

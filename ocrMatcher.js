@@ -6,7 +6,8 @@ const xlsx = require('xlsx');
 const stringSimilarity = require('string-similarity');
 
 // Load DB
-const workbook = xlsx.readFile('식품_제품_리스트.xlsx');
+const path = require('path');
+const workbook = xlsx.readFile(path.join(__dirname, 'DB', '식품_제품_리스트.xlsx'));
 const sheet = workbook.Sheets[workbook.SheetNames[0]];
 const productDB = xlsx.utils.sheet_to_json(sheet);
 

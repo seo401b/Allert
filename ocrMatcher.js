@@ -7,7 +7,7 @@ const stringSimilarity = require('string-similarity');
 
 // Load DB
 const path = require('path');
-const workbook = xlsx.readFile(path.join(__dirname, 'DB', '식품_제품_리스트.xlsx'));
+const workbook = xlsx.readFile(path.join(__dirname, 'DB', 'all_data.xlsx'));
 const sheet = workbook.Sheets[workbook.SheetNames[0]];
 const productDB = xlsx.utils.sheet_to_json(sheet);
 
@@ -43,6 +43,7 @@ function filterProductCandidates(text) {
 
 /** 문자열 정규화 */
 function normalize(str) {
+  if (!str || typeof str !== 'string') return '';
   return str.replace(/\s+/g, '').toLowerCase();
 }
 
@@ -55,18 +56,19 @@ function matchProductName(candidates) {
     const normLine = normalize(line);
 
     for (const product of productDB) {
-      const names = [product.제품명, ...(product.Alias || '').split(',')];
+      const names = [product.prdlstNm, ...(product.Alias || '').split(',')];
 
       for (const name of names) {
+        if (!name) continue;
         const normName = normalize(name);
         const score = stringSimilarity.compareTwoStrings(normLine, normName);
 
         matchScores.push({
-          match: product.제품명,
+          match: product.prdlstNm,
           alias: name,
           line,
           score,
-          allergens: (product.알레르기 || '').split(',').map(s => s.trim())
+          allergens: (product.allergy || '').split(',').map(s => s.trim())
         });
       }
     }
@@ -78,16 +80,66 @@ function matchProductName(candidates) {
   return topMatches.map(({ match, line, allergens }) => ({ match, line, allergens }));
 }
 
+const { GoogleGenerativeAI } = require('@google/generative-ai')
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({model: "gemini-2.0-flash"});
+
+//한영 변환
+async function getKorEngJSONPair(name) {
+  const prompt = `
+  "${name}"를 한국어 <-> 영어 1:1 변환.
+  다른 출력 없이 JSON 형식으로만.
+  예시 :
+  {
+    "korean": "한글",
+    "english": "영어"
+  }
+  `;
+
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt}] }],
+  });
+
+  let raw = result.response.text().trim();
+  raw = raw.replace(/```json|```/g, '').trim();
+
+
+  try {
+    const parsed = JSON.parse(raw);
+
+    console.log(' Gemini 응답 파싱 결과 (JS 객체):', parsed);
+  
+    const variants = new Set([name]);
+    if (parsed.korean) variants.add(parsed.korean);
+    if (parsed.english) variants.add(parsed.english);
+    return Array.from(variants);
+  } catch (err) {
+    console.error('Gemini JSON 파싱 실패:', raw);
+    return [name];
+  }
+}
+
+const { getDefaultImagePath } = require('./commonConfig');
+
 async function getTopMatches() {
-  const imagePath = path.resolve(__dirname, 'test_img', 'milkpopcorn.png');
+  const imagePath = getDefaultImagePath();
   const text = await extractTextFromImage(imagePath);
-  const candidates = filterProductCandidates(text);
-  return matchProductName(candidates);
+  const rawCandidates = filterProductCandidates(text);
+
+  const variantSet = new Set();
+
+  for (const cand of rawCandidates) {
+    const variants = await getKorEngJSONPair(cand);
+    variants.forEach(v => variantSet.add(v));
+  }
+
+  return matchProductName(Array.from(variantSet));
 }
 
 module.exports = {
   extractTextFromImage,
   filterProductCandidates,
   matchProductName,
+  getKorEngJSONPair,
   getTopMatches
 };

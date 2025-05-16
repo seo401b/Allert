@@ -13,10 +13,27 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-04-17"
 
 function cleanUrl(url) {
   if (!url) return null;
-  return url
+  let cleaned = url
     .replace("hacccp.or.kr", "haccp.or.kr")
     .replace(".krr", ".kr")
-    .replace(/\s+/g, "");
+    .replace(/[\s\n\r\t]+/g, "")
+    .trim();
+
+  if (!/^https?:\/\//.test(cleaned)) {
+    cleaned = "https://" + cleaned;
+  }
+
+  return cleaned;
+}
+
+function deduplicateByImageUrl(candidates) {
+  const seen = new Set();
+  return candidates.filter(c => {
+    const url = cleanUrl(c.row.imgurl1);
+    if (seen.has(url)) return false;
+    seen.add(url);
+    return true;
+  });
 }
 
 async function prepareImageForGemini(pathOrUrl, isUrl = false) {
@@ -39,7 +56,7 @@ async function prepareImageForGemini(pathOrUrl, isUrl = false) {
   };
 }
 
-async function analyzeImageWithGemini(base64Image) {
+async function analyzeImageWithGemini(base64Image, maxRetries = 3) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
   const requestData = {
     contents: [
@@ -56,20 +73,37 @@ async function analyzeImageWithGemini(base64Image) {
             {
               "상품명1": { "한글": "한글명", "영어": "영문명" },
               "상품명2": { "한글": "한글명", "영어": "영문명" }
-            }`,
-          },
-        ],
-      },
-    ],
+            }`
+          }
+        ]
+      }
+    ]
   };
-  const response = await axios.post(url, requestData);
-  let rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  rawText = rawText.trim();
-  if (rawText.startsWith("```")) {
-    rawText = rawText.replace(/^```json/, "").replace(/^```/, "").replace(/```$/, "").trim();
+
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      const response = await axios.post(url, requestData);
+      let rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      rawText = rawText.trim();
+
+      if (rawText.startsWith("```")) {
+        rawText = rawText.replace(/^```json/, "").replace(/^```/, "").replace(/```$/, "").trim();
+      }
+
+      const parsed = JSON.parse(rawText);
+      return parsed;
+    } catch (error) {
+      attempt++;
+      console.warn(`❗ Gemini 응답 파싱 실패 - 재시도 중 (${attempt}/${maxRetries})`);
+      if (attempt >= maxRetries) {
+        throw new Error("📛 Gemini 응답을 JSON으로 파싱하지 못했습니다. 최대 재시도 횟수 초과.");
+      }
+    }
   }
-  return JSON.parse(rawText);
 }
+
 
 async function isSameProductImage(baseImagePath, compareImageUrl) {
     const baseImage = await prepareImageForGemini(baseImagePath);
@@ -128,6 +162,55 @@ async function isSameProductImage(baseImagePath, compareImageUrl) {
       return false;
     }
   }
+
+  async function geminiSelectMostLikelyCandidate(baseImagePath, candidates) {
+    const baseImage = await prepareImageForGemini(baseImagePath);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-04-17" });
+  
+    const prompt = `
+  아래 제품 후보 중, 첫 번째 이미지(기준 이미지)와 가장 유사해 보이는 하나의 제품 이미지를 골라줘.
+  선택 기준은 제품명, 포장 색, 구조, 글자, 브랜드, 전반적인 외관 등을 종합적으로 고려한 이미지 유사성이다.
+  반드시 JSON 형식으로 다음처럼 반환해:
+  { "selectedUrl": "http://..." }
+  
+  후보 이미지들:
+  ${candidates.map(c => cleanUrl(c.row.imgurl1)).join("\n")}
+  `;
+  
+    let attempt = 1;
+  
+    while (attempt <= 3) {
+      try {
+        const result = await model.generateContent({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: prompt },
+                baseImage
+              ]
+            }
+          ]
+        });
+  
+        let reply = result.response.text().trim();
+        if (reply.startsWith("```")) {
+          reply = reply.replace(/^```json/, "").replace(/^```/, "").replace(/```$/, "").trim();
+        }
+  
+        const parsed = JSON.parse(reply);
+        return parsed.selectedUrl;
+      } catch (err) {
+        console.warn(`⚠️ Gemini Fallback 응답 파싱 실패 - ${attempt}회차 재시도 중...`);
+        attempt++;
+        await new Promise(res => setTimeout(res, 1000)); // 1초 대기
+      }
+    }
+  
+    console.error("❌ Gemini fallback JSON 파싱 3회 실패: 후보 선택 불가");
+    return null;
+  }
+  
   
 
 async function extractProductNamesFromImage(imagePath) {
@@ -136,23 +219,35 @@ async function extractProductNamesFromImage(imagePath) {
   return await analyzeImageWithGemini(base64Image);
 }
 
-function findRoughlySimilarProducts(targetName, data, topN = 100) {
-  const names = data.map(row => row["prdlstNm"]).filter(Boolean);
+function findRoughlySimilarProducts(targetName, data, topN = 30) {
+  const nameToRowMap = new Map();
+  const names = [];
+
+  for (const row of data) {
+    const name = row["prdlstNm"];
+    if (name) {
+      names.push(name);
+      nameToRowMap.set(name, row);
+    }
+  }
+
   const result = stringSimilarity.findBestMatch(targetName, names);
+  
   return result.ratings
     .sort((a, b) => b.rating - a.rating)
     .slice(0, topN)
     .map(match => ({
       ...match,
-      row: data.find(r => r["prdlstNm"] === match.target)
+      row: nameToRowMap.get(match.target)
     }))
     .filter(item => item.row?.imgurl1);
 }
 
+
 async function refineWithGemini(productName, candidates, topN = 5) {
   const prompt = `
 다음은 "${productName}"이라는 상품명과 유사한 제품 이름 목록이야.
-가장 유사한 상품을 최대 ${topN}개까지 JSON 배열로만 반환해줘.
+가장 유사한 상품을 ${topN}개의 JSON 배열로만 반환해줘.
 
 예시:
 ["제품A", "제품B", "제품C"]
@@ -169,17 +264,40 @@ ${candidates.map(c => `- ${c.target}`).join("\n")}
 }
 
 async function compareImagesToFindExactMatch(baseImagePath, candidates) {
-  for (const candidate of candidates) {
-    const fixedUrl = cleanUrl(candidate.row.imgurl1);
-    const isSame = await isSameProductImage(baseImagePath, fixedUrl);
-    if (isSame) {
-      return {
-        matched: candidate.row,
-        imageUrl: fixedUrl
-      };
+  // 실제 비교 함수
+  async function tryMatch() {
+    for (const candidate of candidates) {
+      const fixedUrl = cleanUrl(candidate.row.imgurl1);
+      const isSame = await isSameProductImage(baseImagePath, fixedUrl);
+      if (isSame) {
+        return {
+          matched: candidate.row,
+          imageUrl: fixedUrl
+        };
+      }
+    }
+    return null;
+  }
+
+  // 첫 시도
+  let result = await tryMatch();
+
+  // 실패 시 한 번 더 재시도 (fallback 반환)
+  if (!result) {
+    console.log("🔄 Gemini를 사용해 최적 후보 fallback 시도...");
+    const selectedUrl = await geminiSelectMostLikelyCandidate(baseImagePath, candidates);
+    if (selectedUrl) {
+      const match = candidates.find(c => cleanUrl(c.row.imgurl1) === selectedUrl);
+      if (match) {
+        return {
+          matched: match.row,
+          imageUrl: selectedUrl
+        };
+      }
     }
   }
-  return null;
+
+  return result;
 }
 
 async function main(imagePath, excelPath) {
@@ -195,10 +313,12 @@ async function main(imagePath, excelPath) {
     const candidates = findRoughlySimilarProducts(names.한글, data);
     const refinedNames = await refineWithGemini(names.한글, candidates);
     const refinedCandidates = candidates.filter(c => refinedNames.includes(c.target));
-    console.log("🔍 이미지 비교 대상 목록:");
-    refinedCandidates.forEach(c => console.log(`- ${c.target}: ${cleanUrl(c.row.imgurl1)}`));
 
-    const finalMatch = await compareImagesToFindExactMatch(imagePath, refinedCandidates);
+    const uniqueCandidates = deduplicateByImageUrl(refinedCandidates);
+    console.log("🔍 이미지 비교 대상 목록:");
+    uniqueCandidates.forEach(c => console.log(`- ${c.target}: ${cleanUrl(c.row.imgurl1)}`));
+
+    const finalMatch = await compareImagesToFindExactMatch(imagePath, uniqueCandidates);
 
     if (finalMatch) {
       console.log(`✅ 최종 매칭된 상품: ${finalMatch.matched.prdlstNm}`);
@@ -206,16 +326,6 @@ async function main(imagePath, excelPath) {
       console.log(`🖼️ 이미지: ${cleanUrl(finalMatch.imageUrl)}`);//출력은 되는데 url이 이상함;;
     } else {
       console.log("❌ 최종 매칭 실패: 이미지 상 동일한 제품을 찾을 수 없음.");
-
-      const fallback = await findMostSimilarProductImage(imagePath, refinedCandidates);
-      if (fallback) {
-        console.log("🟡 가장 유사한 제품 (Gemini 이미지 기반 추천):");
-        console.log(`- ${fallback.target}`);
-        console.log(`⚠️ 알레르기 정보: ${fallback.row.allergy || "정보 없음"}`);
-        console.log(`🖼️ 이미지: ${cleanUrl(fallback.row.imgurl1)}`);
-      } else {
-        console.log("❌ Gemini로도 유사한 제품을 선택할 수 없었습니다.");
-      }
     }
   }
 }
